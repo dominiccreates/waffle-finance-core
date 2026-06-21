@@ -11,12 +11,39 @@
  *
  * The watchdog is best-effort: failures are logged but never thrown so
  * one bad order can't take down the entire timer.
+ *
+ * ## Metrics
+ *
+ * All activity is recorded via the relayer's Prometheus metrics registry
+ * (see `../metrics.ts`). Key metrics emitted per tick:
+ *
+ *   relayer_refund_watchdog_runs_total              — tick completed
+ *   relayer_refund_watchdog_success_total           — per successful refund
+ *   relayer_refund_watchdog_failure_total           — per failed refund
+ *   relayer_refund_watchdog_stale_orders_detected_total — stale orders found
+ *   relayer_refund_watchdog_backoff_skips_total     — orders skipped (back-off)
+ *   relayer_refund_watchdog_last_run_timestamp_seconds — epoch of last tick
+ *   relayer_refund_watchdog_max_stale_age_seconds   — oldest stale order age
+ *   relayer_refund_watchdog_pending_refunds         — orders awaiting refund
+ *   relayer_refund_watchdog_tick_duration_seconds   — tick latency histogram
  */
 
 import { refundXlmToUser, type RefundNetworkMode } from './xlm-refund.js';
+import {
+  watchdogRunsTotal,
+  watchdogRefundSuccessTotal,
+  watchdogRefundFailureTotal,
+  watchdogStaleOrdersDetected,
+  watchdogBackoffSkipsTotal,
+  watchdogLastRunTimestamp,
+  watchdogMaxStaleAgeSeconds,
+  watchdogPendingRefundsGauge,
+  watchdogTickDurationSeconds,
+} from '../metrics.js';
 
-const DEFAULT_INTERVAL_MS = 60_000; // 1 minute
+const DEFAULT_INTERVAL_MS = 60_000;   // 1 minute
 const DEFAULT_STALE_AFTER_MS = 5 * 60_000; // 5 minutes
+const BACKOFF_MS = 10 * 60_000;       // 10 minutes after a failure
 
 interface WatchdogOrder {
   orderId?: string;
@@ -56,7 +83,9 @@ export interface WatchdogConfig {
   activeOrders: Map<string, WatchdogOrder>;
 }
 
-function toMillis(value: WatchdogOrder['xlmReceivedAt'] | WatchdogOrder['created']): number | null {
+function toMillis(
+  value: WatchdogOrder['xlmReceivedAt'] | WatchdogOrder['created']
+): number | null {
   if (value == null) return null;
   if (typeof value === 'number') return value > 1e12 ? value : value * 1000;
   const parsed = Date.parse(String(value));
@@ -77,62 +106,117 @@ export function startRefundWatchdog(config: WatchdogConfig): { stop: () => void 
   const staleAfterMs = config.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
 
   console.log(
-    `[refund-watchdog] starting · scan every ${Math.round(intervalMs / 1000)}s · refund after ${Math.round(staleAfterMs / 1000)}s · network=${config.networkMode}`
+    `[refund-watchdog] starting · scan every ${Math.round(intervalMs / 1000)}s` +
+    ` · refund after ${Math.round(staleAfterMs / 1000)}s` +
+    ` · network=${config.networkMode}`
   );
 
-  const tick = async () => {
+  const tick = async (): Promise<void> => {
+    const tickEnd = watchdogTickDurationSeconds.startTimer();
     const now = Date.now();
-    for (const [orderId, order] of config.activeOrders.entries()) {
-      try {
-        if (!isXlmToEthAwaitingEth(order)) continue;
-        if (order.watchdogFailedAt && now - order.watchdogFailedAt < 10 * 60_000) {
-          // back off for 10 minutes after a failed attempt
-          continue;
+
+    let maxStaleAgeMs = 0;
+    let pendingCount = 0;
+
+    try {
+      for (const [orderId, order] of config.activeOrders.entries()) {
+        try {
+          if (!isXlmToEthAwaitingEth(order)) continue;
+
+          pendingCount++;
+
+          // Back-off: skip for 10 min after a prior failure on this order.
+          if (order.watchdogFailedAt && now - order.watchdogFailedAt < BACKOFF_MS) {
+            watchdogBackoffSkipsTotal.inc();
+            continue;
+          }
+
+          const startedAt =
+            toMillis(order.xlmReceivedAt) ?? toMillis(order.created);
+          if (!startedAt) continue;
+
+          const age = now - startedAt;
+          if (age < staleAfterMs) continue;
+
+          // This order is stale and eligible for refund.
+          maxStaleAgeMs = Math.max(maxStaleAgeMs, age);
+          watchdogStaleOrdersDetected.inc();
+
+          const stellarAddress = order.stellarAddress;
+          if (!stellarAddress) {
+            console.warn(
+              `[refund-watchdog] order ${orderId} stuck but missing` +
+              ` stellarAddress; skipping`
+            );
+            watchdogRefundFailureTotal.inc({
+              reason: 'missing_address',
+              network_mode: config.networkMode,
+            });
+            continue;
+          }
+
+          console.log(
+            `[refund-watchdog] refunding ${orderId}` +
+            ` — pending for ${Math.round(age / 1000)}s,` +
+            ` stellarTx=${order.stellarTxHash}`
+          );
+
+          const refund = await refundXlmToUser({
+            orderId,
+            stellarAddress,
+            stellarTxHash: order.stellarTxHash,
+            networkMode: config.networkMode,
+            horizonUrl: config.horizonUrl,
+            refundSecret: config.refundSecret,
+            fallbackXlmAmount: order.amount ? String(order.amount) : undefined,
+          });
+
+          order.status = 'refunded';
+          order.refundTxHash = refund.hash;
+          order.refundedAt = Date.now();
+
+          watchdogRefundSuccessTotal.inc({ network_mode: config.networkMode });
+
+          console.log(
+            `[refund-watchdog] ✅ refunded ${refund.amount} XLM` +
+            ` → ${stellarAddress} (tx=${refund.hash})`
+          );
+        } catch (err: unknown) {
+          order.watchdogFailedAt = Date.now();
+          order.watchdogFailureReason =
+            err instanceof Error ? err.message : String(err);
+
+          watchdogRefundFailureTotal.inc({
+            reason: 'refund_error',
+            network_mode: config.networkMode,
+          });
+
+          console.error(
+            `[refund-watchdog] ❌ failed to refund ${orderId}:`,
+            err instanceof Error ? err.message : err
+          );
         }
-
-        const startedAt = toMillis(order.xlmReceivedAt) ?? toMillis(order.created);
-        if (!startedAt) continue;
-        const age = now - startedAt;
-        if (age < staleAfterMs) continue;
-
-        const stellarAddress = order.stellarAddress;
-        if (!stellarAddress) {
-          console.warn(`[refund-watchdog] order ${orderId} stuck but missing stellarAddress; skipping`);
-          continue;
-        }
-
-        console.log(
-          `[refund-watchdog] refunding ${orderId} — pending for ${Math.round(age / 1000)}s, stellarTx=${order.stellarTxHash}`
-        );
-
-        const refund = await refundXlmToUser({
-          orderId,
-          stellarAddress,
-          stellarTxHash: order.stellarTxHash,
-          networkMode: config.networkMode,
-          horizonUrl: config.horizonUrl,
-          refundSecret: config.refundSecret,
-          fallbackXlmAmount: order.amount ? String(order.amount) : undefined,
-        });
-
-        order.status = 'refunded';
-        order.refundTxHash = refund.hash;
-        order.refundedAt = Date.now();
-        console.log(
-          `[refund-watchdog] ✅ refunded ${refund.amount} XLM → ${stellarAddress} (tx=${refund.hash})`
-        );
-      } catch (err: any) {
-        order.watchdogFailedAt = Date.now();
-        order.watchdogFailureReason = err?.message ?? String(err);
-        console.error(`[refund-watchdog] ❌ failed to refund ${orderId}:`, err?.message ?? err);
       }
+    } finally {
+      // Always record tick completion and gauges — even if an unexpected
+      // error escapes the inner loop, we want visibility.
+      tickEnd();
+      watchdogRunsTotal.inc();
+      watchdogLastRunTimestamp.set(Math.floor(Date.now() / 1000));
+      watchdogMaxStaleAgeSeconds.set(maxStaleAgeMs / 1000);
+      watchdogPendingRefundsGauge.set(pendingCount);
     }
   };
 
   // Fire-and-forget first scan after a short warm-up so the watchdog
   // doesn't race with relayer startup logic.
-  const warmup = setTimeout(() => { void tick(); }, 15_000);
-  const handle = setInterval(() => { void tick(); }, intervalMs);
+  const warmup = setTimeout(() => {
+    void tick();
+  }, 15_000);
+
+  const handle = setInterval(() => {
+    void tick();
+  }, intervalMs);
 
   return {
     stop() {
@@ -141,3 +225,6 @@ export function startRefundWatchdog(config: WatchdogConfig): { stop: () => void 
     },
   };
 }
+
+// Re-export tick internals for testing without starting the interval.
+export { isXlmToEthAwaitingEth, toMillis };

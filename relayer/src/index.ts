@@ -658,6 +658,10 @@ async function initializeRelayer() {
   // POST /api/orders/create - Create bridge order (Frontend Integration)
   console.log("📍 DEBUG: About to register orders endpoint");
   
+  // Prometheus metrics endpoint — no sensitive data exposed.
+  const { metricsRouter } = await import('./routes/metrics.js');
+  app.use(metricsRouter());
+
   // Root route first
   app.get('/', (req, res) => {
     res.json({ message: 'WaffleFinance Relayer API', status: 'running' });
