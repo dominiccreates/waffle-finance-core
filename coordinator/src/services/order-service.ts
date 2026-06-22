@@ -117,4 +117,18 @@ export class OrderService {
     this.log.info({ publicId, status }, "status updated");
     ordersTotal.inc({ status });
   }
+
+  async rollbackSrcLock(publicId: string): Promise<void> {
+    await this.repo.rollbackSrcLock(publicId);
+    this.log.warn({ publicId }, "rolled back src lock");
+  }
+
+  async rollbackDstLock(publicId: string): Promise<void> {
+    await this.repo.rollbackDstLock(publicId);
+    this.log.warn({ publicId }, "rolled back dst lock");
+  }
+
+  async getLastProcessedBlock(chain: Chain): Promise<number> {
+    return this.repo.getLastProcessedBlock(chain);
+  }
 }

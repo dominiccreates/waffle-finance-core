@@ -145,6 +145,8 @@ export class OrdersRepository {
   private readonly updateSrcLock: Statement;
   private readonly updateDstLock: Statement;
   private readonly updateSecret: Statement;
+  private readonly rollbackSrc: Statement;
+  private readonly rollbackDst: Statement;
 
   constructor(private readonly db: DatabaseT) {
     this.insertStmt = db.prepare(`
@@ -209,6 +211,27 @@ export class OrdersRepository {
         status = 'secret_revealed',
         updated_at = CAST(strftime('%s','now') AS INTEGER)
       WHERE public_id = :publicId
+    `);
+    this.rollbackSrc = db.prepare(`
+      UPDATE orders SET
+        src_order_id = NULL,
+        src_lock_tx = NULL,
+        src_lock_block = NULL,
+        src_timelock = NULL,
+        status = 'announced',
+        updated_at = CAST(strftime('%s','now') AS INTEGER)
+      WHERE public_id = :publicId AND status = 'src_locked'
+    `);
+    this.rollbackDst = db.prepare(`
+      UPDATE orders SET
+        dst_order_id = NULL,
+        dst_lock_tx = NULL,
+        dst_lock_block = NULL,
+        dst_timelock = NULL,
+        resolver_address = NULL,
+        status = 'src_locked',
+        updated_at = CAST(strftime('%s','now') AS INTEGER)
+      WHERE public_id = :publicId AND status = 'dst_locked'
     `);
   }
 
@@ -340,5 +363,27 @@ export class OrdersRepository {
       txHash: input.txHash,
       encVersion: input.encVersion ?? null
     });
+  }
+
+  async rollbackSrcLock(publicId: string): Promise<void> {
+    await this.run(this.rollbackSrc, { publicId });
+  }
+
+  async rollbackDstLock(publicId: string): Promise<void> {
+    await this.run(this.rollbackDst, { publicId });
+  }
+
+  async getLastProcessedBlock(chain: Chain): Promise<number> {
+    const srcRow = await this.get<{ max_block: number | null }>(
+      this.db.prepare("SELECT MAX(src_lock_block) AS max_block FROM orders WHERE src_chain = ?"),
+      chain
+    );
+    const dstRow = await this.get<{ max_block: number | null }>(
+      this.db.prepare("SELECT MAX(dst_lock_block) AS max_block FROM orders WHERE dst_chain = ?"),
+      chain
+    );
+    const srcMax = srcRow?.max_block ?? 0;
+    const dstMax = dstRow?.max_block ?? 0;
+    return Math.max(srcMax, dstMax);
   }
 }
