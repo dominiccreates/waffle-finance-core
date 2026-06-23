@@ -5,6 +5,7 @@ import type { OrderRow } from "../../persistence/orders-repo.js";
 import type { OrderService } from "../../services/order-service.js";
 import { OrderValidationError } from "../../services/order-service.js";
 import { announceSchema } from "../../validation/announce.js";
+import { historyAddressSchema } from "../../validation/address.js";
 import { makeRateLimiter, loadApiKeys, loadTrustedProxies } from "../middleware/ratelimit.js";
 
 function serialiseOrder(order: OrderRow | null) {
@@ -81,6 +82,28 @@ export function ordersRoutes(orders: OrderService, log?: Logger): Router {
     }
   });
 
+  // NOTE: the literal /orders/history route must be registered before the
+  // /orders/:id param route, otherwise Express matches "history" as an :id.
+  router.get("/orders/history", async (req, res, next) => {
+    const parsedAddress = historyAddressSchema.safeParse(req.query.address);
+    if (!parsedAddress.success) {
+      res.status(400).json({ error: "validation_error", details: parsedAddress.error.errors });
+      return;
+    }
+    const address = parsedAddress.data;
+    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const offset = Math.max(Number(req.query.offset ?? 0), 0);
+    try {
+      const list = await orders.history(address, limit, offset);
+      res.json({
+        transactions: list.map((o) => serialiseOrder(o)).filter(Boolean),
+        pagination: { limit, offset, count: list.length }
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.get("/orders/:id", async (req, res, next) => {
     const id = req.params.id;
     try {
@@ -90,25 +113,6 @@ export function ordersRoutes(orders: OrderService, log?: Logger): Router {
         return;
       }
       res.json(serialiseOrder(order));
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  router.get("/orders/history", async (req, res, next) => {
-    const address = (req.query.address as string | undefined) ?? "";
-    if (!address) {
-      res.status(400).json({ error: "address_required" });
-      return;
-    }
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
-    const offset = Math.max(Number(req.query.offset ?? 0), 0);
-    try {
-      const list = await orders.history(address, limit, offset);
-      res.json({
-        transactions: list.map((o) => serialiseOrder(o)).filter(Boolean),
-        pagination: { limit, offset, count: list.length }
-      });
     } catch (err) {
       next(err);
     }
