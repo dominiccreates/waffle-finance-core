@@ -227,8 +227,7 @@ export async function queryMigrations(db: Database): Promise<MigrationRecord[]> 
  */
 export async function getCurrentSchemaVersion(db: Database): Promise<string | null> {
   const migrations = await queryMigrations(db);
-  if (migrations.length === 0) return null;
-  return migrations[migrations.length - 1].migration;
+  return migrations.at(-1)?.migration ?? null;
 }
 
 // ── openDatabase ─────────────────────────────────────────────────────────────
