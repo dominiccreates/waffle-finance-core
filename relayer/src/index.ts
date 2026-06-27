@@ -662,6 +662,10 @@ async function initializeRelayer() {
   const { metricsRouter } = await import('./routes/metrics.js');
   app.use(metricsRouter());
 
+  // Liveness health endpoint for orchestrators and monitoring.
+  const { healthRouter } = await import('./routes/health.js');
+  app.use(healthRouter());
+
   // Root route first
   app.get('/', (req, res) => {
     res.json({ message: 'WaffleFinance Relayer API', status: 'running' });
